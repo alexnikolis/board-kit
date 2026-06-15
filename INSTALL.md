@@ -42,7 +42,30 @@ two modes — PR-based or fully local (see [Autonomous orchestration](#autonomou
   them. **Local mode needs neither** `gh` nor a remote. The base board (CLI + skill) never
   needs `gh`.
 
-## Steps
+## Quick install (script)
+
+The `install.sh` bootstrap automates everything in **Manual install** below. Run it from the
+root of the target repo, on the integration branch, with a clean working tree:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alexnikolis/board-kit/main/install.sh | bash -s -- --project <project>
+#   or, from a clone/extract of board-kit:  /path/to/board-kit/install.sh --project <project>
+```
+
+It copies only the payload (so this repo's own `README.md` / `CLAUDE.md` / `INSTALL.md` don't
+follow), renames the skill to `<project>-board`, runs `board init`, and **stages** the new files
+— it does **not** commit, so you can review first. Flags:
+
+- `--project <name>` — names the skill `<name>-board` (default: the target repo's dir name).
+- `--main-branch <branch>` — install on a `master`/`trunk` integration branch.
+- `--base-only` — board + skill only; skip the orchestration agents/command.
+- `--update` — refresh the skill/agents/command in place, leaving `.board/` ticket data untouched.
+
+Then review and commit (e.g. `git commit -m "Add project board"`), and continue from
+[Point your agents at the board](#point-your-agents-at-the-board). The manual steps below are
+kept for transparency and as a fallback.
+
+## Manual install
 
 Run from the **root of the target repo**, on the integration branch, with a clean
 working tree. Replace `<project>` with a short repo name (used only to name the

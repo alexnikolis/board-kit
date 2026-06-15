@@ -28,17 +28,17 @@ issue tracker rather than bolting automation onto this.
 
 ## Quick start
 
-From the root of your target repo, on a clean integration branch:
+From the root of your target repo, on a clean integration branch, run the installer — it
+copies the board + skill + orchestration layer into place, renames the skill to
+`<project>-board`, runs `board init`, and stages the result (it does not commit):
 
 ```bash
-cp -R /path/to/board-kit/board ./.board
-chmod +x .board/bin/board .board/bin/_lib.sh
-.board/bin/board init          # scaffolds the columns + ID allocator
-.board/bin/board doctor        # → "board: clean"
+curl -fsSL https://raw.githubusercontent.com/alexnikolis/board-kit/main/install.sh | bash -s -- --project myrepo
 ```
 
-That stands up the board itself. To also install the agent skill and the autonomous
-orchestration layer, follow the full guide in **[INSTALL.md](INSTALL.md)**.
+Flags: `--project <name>`, `--main-branch <branch>`, `--base-only` (board + skill only),
+`--update` (refresh the skill/agents/command without touching `.board/` data). See
+**[INSTALL.md](INSTALL.md)** for the full guide, including the manual steps the script automates.
 
 ```bash
 .board/bin/board create --title "Set up CI" --estimate S --yes

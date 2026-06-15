@@ -1,0 +1,663 @@
+#!/usr/bin/env bash
+# board — filesystem project board dispatcher.
+# Usage: board <subcommand> [args]
+# Run `board help` for the list of subcommands.
+
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=_lib.sh
+source "$HERE/_lib.sh"
+
+usage() {
+  cat <<EOF
+board — filesystem project board CLI
+
+Subcommands:
+  init                              scaffold an empty board (column dirs + .next-id)
+  next                              list claimable tickets (todo + deps in done + unclaimed)
+  create --title "..." [--estimate S|M|L] [--depends-on T-NNN,...] [--slug ...] [--edit] [--yes]
+                                    mint a new ticket; allocates next ID atomically
+  update <id> [--title "..."] [--estimate S|M|L]
+              [--add-dep T-NNN]... [--remove-dep T-NNN]... [--set-deps T-001,T-005] [--yes]
+                                    edit frontmatter of an existing ticket
+  claim <id> [--agent <name>] [--yes]
+                                    atomically claim a ticket and create its worktree
+  transition <id> <to> [--yes]      move ticket to <to> (todo|in-progress|in-review|blocked|done)
+  block <id> "<reason>"             move to blocked/ with a reason
+  unblock <id> <to>                 move out of blocked/ to <to>
+  status                            one-screen overview of the board
+  show <id>                         print a ticket's contents
+  doctor                            run sanity checks on the board
+  help                              this message
+
+Environment:
+  BOARD_REPO_ROOT   override repo root (default: walks up from this script)
+  BOARD_MAIN_BRANCH override the integration branch (default: main)
+  ASSUME_YES=1      same as passing --yes to mutating commands
+
+Canonical reference: .board/README.md
+EOF
+}
+
+# ---------- subcommand: init ----------
+
+cmd_init() {
+  # Scaffold an empty board next to these scripts. Safe to re-run: never
+  # clobbers an existing column or .next-id. Run once when standing up a board.
+  require_main_checkout
+  local col
+  for col in "${COLUMNS[@]}"; do
+    mkdir -p "$BOARD_DIR/$col"
+    # Keep empty columns under version control.
+    [[ -e "$BOARD_DIR/$col/.gitkeep" ]] || : > "$BOARD_DIR/$col/.gitkeep"
+  done
+  local nf; nf=$(NEXT_ID_FILE)
+  if [[ ! -f "$nf" ]]; then
+    echo 1 > "$nf"
+    echo "wrote $nf (= 1)"
+  fi
+  if [[ ! -f "$BOARD_DIR/_template.md" ]]; then
+    warn "no _template.md in $BOARD_DIR — copy the kit's _template.md before creating tickets"
+  fi
+  echo "board scaffolded at $BOARD_DIR"
+  echo "columns: ${COLUMNS[*]}"
+  echo "next: commit .board/, then 'board create --title \"...\"'"
+}
+
+# ---------- subcommand: next ----------
+
+cmd_next() {
+  local f any=0
+  for f in "$BOARD_DIR"/todo/T-*.md; do
+    [[ -e "$f" ]] || continue
+    local agent
+    agent=$(read_field "$f" "agent" 2>/dev/null || echo "null")
+    [[ "$agent" != "null" ]] && continue
+    if deps_satisfied "$f" >/dev/null 2>&1; then
+      local id title
+      id=$(yq -r '.id' <(awk 'BEGIN{c=0} /^---$/{c++;next} c==1' "$f"))
+      title=$(yq -r '.title' <(awk 'BEGIN{c=0} /^---$/{c++;next} c==1' "$f"))
+      printf '%s  %s\n' "$id" "$title"
+      any=1
+    fi
+  done
+  [[ $any -eq 1 ]] || { warn "no claimable tickets in todo/"; exit 1; }
+}
+
+# ---------- subcommand: create ----------
+
+# Writes a fresh ticket file at $1 (path) with id $2 and frontmatter from
+# globals: TITLE, ESTIMATE, DEPS_CSV. Body is the template body with the H1
+# replaced.
+write_new_ticket() {
+  local path="$1" id="$2"
+  cp "$BOARD_DIR/_template.md" "$path"
+  write_field "$path" "id" "\"$id\""
+  write_field "$path" "title" "\"$TITLE\""
+  write_field "$path" "estimate" "\"$ESTIMATE\""
+  # depends_on as a YAML flow list
+  local deps_yaml="[]"
+  if [[ -n "$DEPS_CSV" ]]; then
+    local quoted=""
+    local d
+    for d in ${DEPS_CSV//,/ }; do
+      [[ -z "$d" ]] && continue
+      quoted+="\"$d\","
+    done
+    deps_yaml="[${quoted%,}]"
+  fi
+  write_field "$path" "depends_on" "$deps_yaml"
+  # Rewrite the body H1 line so it matches the new id + title.
+  # Body starts after the second --- line. Replace the first '# T-NNN — ...' line.
+  local tmp; tmp=$(mktemp)
+  awk -v id="$id" -v title="$TITLE" '
+    BEGIN { c = 0; replaced = 0 }
+    /^---[[:space:]]*$/ { c++; print; next }
+    c >= 2 && !replaced && /^# / { print "# " id " — " title; replaced = 1; next }
+    { print }
+  ' "$path" > "$tmp"
+  mv "$tmp" "$path"
+}
+
+cmd_create() {
+  TITLE=""; ESTIMATE="M"; DEPS_CSV=""; local SLUG=""; local OPEN_EDITOR=0; local assume_yes=0
+  while (($#)); do
+    case "$1" in
+      --title) TITLE="$2"; shift 2 ;;
+      --estimate) ESTIMATE="$2"; shift 2 ;;
+      --depends-on) DEPS_CSV="$2"; shift 2 ;;
+      --slug) SLUG="$2"; shift 2 ;;
+      --edit) OPEN_EDITOR=1; shift ;;
+      --yes|-y) assume_yes=1; shift ;;
+      *) die "unknown arg to create: $1" ;;
+    esac
+  done
+  [[ -n "$TITLE" ]] || die "usage: board create --title \"...\" [...]"
+  [[ "$ESTIMATE" =~ ^[SML]$ ]] || die "estimate must be S, M, or L"
+  ASSUME_YES=$assume_yes
+
+  require_yq
+  require_main_checkout
+  require_clean
+  validate_dep_ids "$DEPS_CSV"
+
+  [[ -n "$SLUG" ]] || SLUG=$(slugify "$TITLE")
+  [[ -n "$SLUG" ]] || die "could not derive a slug from title; pass --slug"
+
+  local attempts=0
+  local max_attempts=3
+  while :; do
+    attempts=$((attempts + 1))
+
+    if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+      git -C "$ROOT" pull --rebase --quiet origin "$MAIN_BRANCH"
+    fi
+
+    local n max_n id new_path next_id_file
+    n=$(read_next_id)
+    max_n=$(max_existing_id)
+    if (( n <= max_n )); then
+      die ".next-id ($n) is not greater than max existing T-id ($max_n); run: board doctor"
+    fi
+    id=$(format_id "$n")
+    new_path="$BOARD_DIR/todo/$id-$SLUG.md"
+    [[ -e "$new_path" ]] && die "destination already exists: $new_path"
+
+    write_new_ticket "$new_path" "$id"
+    write_next_id $((n + 1))
+    next_id_file=$(NEXT_ID_FILE)
+
+    git -C "$ROOT" add "$new_path" "$next_id_file"
+    git -C "$ROOT" commit --quiet -m "$id: open"
+
+    if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+      if git -C "$ROOT" push --quiet origin "$MAIN_BRANCH" 2>/dev/null; then
+        echo "created $id at $new_path"
+        [[ $OPEN_EDITOR -eq 1 && -n "${EDITOR:-}" ]] && "$EDITOR" "$new_path"
+        return 0
+      fi
+      warn "push rejected on attempt $attempts; resetting and retrying"
+      git -C "$ROOT" reset --hard --quiet "origin/$MAIN_BRANCH"
+      if (( attempts >= max_attempts )); then
+        echo "create_lost" >&2
+        exit 2
+      fi
+      continue
+    fi
+
+    # No remote: local-only success.
+    echo "created $id at $new_path"
+    [[ $OPEN_EDITOR -eq 1 && -n "${EDITOR:-}" ]] && "$EDITOR" "$new_path"
+    return 0
+  done
+}
+
+# ---------- subcommand: update ----------
+
+# Merge add/remove/set ops into a deduped, sorted depends_on list on $file.
+# Args: file
+# Reads globals ADD_DEPS, REMOVE_DEPS, SET_DEPS, OWN_ID.
+apply_dep_edits() {
+  local file="$1"
+  local current
+  current=$(read_field "$file" "depends_on" | yq -r '.[]?' 2>/dev/null || true)
+
+  if [[ -n "$SET_DEPS" ]]; then
+    current=$(echo "${SET_DEPS//,/$'\n'}")
+  fi
+
+  local merged
+  merged=$(printf '%s\n' $current ${ADD_DEPS//,/ } | sort -u | grep -E '^T-[0-9]+$' || true)
+  if [[ -n "$REMOVE_DEPS" ]]; then
+    local r
+    for r in ${REMOVE_DEPS//,/ }; do
+      merged=$(echo "$merged" | grep -vxF "$r" || true)
+    done
+  fi
+
+  # Self-reference guard.
+  if echo "$merged" | grep -qxF "$OWN_ID"; then
+    die "refuse to add $OWN_ID as its own dependency"
+  fi
+
+  # Build YAML flow list.
+  local deps_yaml="[]"
+  if [[ -n "$merged" ]]; then
+    local quoted=""
+    local d
+    while IFS= read -r d; do
+      [[ -z "$d" ]] && continue
+      quoted+="\"$d\","
+    done <<< "$merged"
+    deps_yaml="[${quoted%,}]"
+  fi
+  write_field "$file" "depends_on" "$deps_yaml"
+}
+
+cmd_update() {
+  local id="" NEW_TITLE="" NEW_ESTIMATE="" assume_yes=0
+  ADD_DEPS=""; REMOVE_DEPS=""; SET_DEPS=""
+  while (($#)); do
+    case "$1" in
+      --title) NEW_TITLE="$2"; shift 2 ;;
+      --estimate) NEW_ESTIMATE="$2"; shift 2 ;;
+      --add-dep) ADD_DEPS+="${ADD_DEPS:+,}$2"; shift 2 ;;
+      --remove-dep) REMOVE_DEPS+="${REMOVE_DEPS:+,}$2"; shift 2 ;;
+      --set-deps) SET_DEPS="$2"; shift 2 ;;
+      --yes|-y) assume_yes=1; shift ;;
+      T-*) id="$1"; shift ;;
+      *) die "unknown arg to update: $1" ;;
+    esac
+  done
+  [[ -n "$id" ]] || die "usage: board update <id> [--title ...] [--estimate ...] [--add-dep ...] ..."
+  ASSUME_YES=$assume_yes
+  OWN_ID="$id"
+
+  require_yq
+  require_main_checkout
+  require_clean
+
+  local file
+  file=$(find_ticket "$id") || exit 1
+  local col
+  col=$(column_of "$file")
+
+  # Refuse silently-dangerous dep edits on active tickets without explicit yes.
+  if [[ -n "$ADD_DEPS$REMOVE_DEPS$SET_DEPS" && "$col" != "todo" && "$col" != "blocked" ]]; then
+    if [[ "${ASSUME_YES:-0}" != "1" ]]; then
+      die "changing deps on a ticket in $col/ requires --yes (this can invalidate in-flight work)"
+    fi
+    warn "editing deps on $id (currently in $col/) — make sure the owning agent knows"
+  fi
+
+  # Validate any deps referenced.
+  validate_dep_ids "$ADD_DEPS"
+  validate_dep_ids "$SET_DEPS"
+  # REMOVE_DEPS doesn't need existence validation — removing a stale id is fine.
+
+  local changed=()
+
+  if [[ -n "$NEW_TITLE" ]]; then
+    write_field "$file" "title" "\"$NEW_TITLE\""
+    # Update body H1 (first H1 line after the second ---).
+    local tmp; tmp=$(mktemp)
+    awk -v id="$id" -v title="$NEW_TITLE" '
+      BEGIN { c = 0; replaced = 0 }
+      /^---[[:space:]]*$/ { c++; print; next }
+      c >= 2 && !replaced && /^# / { print "# " id " — " title; replaced = 1; next }
+      { print }
+    ' "$file" > "$tmp"
+    mv "$tmp" "$file"
+    changed+=(title)
+  fi
+
+  if [[ -n "$NEW_ESTIMATE" ]]; then
+    [[ "$NEW_ESTIMATE" =~ ^[SML]$ ]] || die "estimate must be S, M, or L"
+    write_field "$file" "estimate" "\"$NEW_ESTIMATE\""
+    changed+=(estimate)
+  fi
+
+  if [[ -n "$ADD_DEPS$REMOVE_DEPS$SET_DEPS" ]]; then
+    apply_dep_edits "$file"
+    changed+=(depends_on)
+  fi
+
+  if [[ ${#changed[@]} -eq 0 ]]; then
+    echo "no changes specified"
+    return 0
+  fi
+
+  local summary
+  summary=$(IFS=,; echo "${changed[*]}")
+  git -C "$ROOT" add "$file"
+  git -C "$ROOT" commit --quiet -m "$id: update ($summary)"
+  if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+    git -C "$ROOT" push --quiet origin "$MAIN_BRANCH" || warn "push failed; resolve and push manually"
+  fi
+  echo "$id updated: $summary"
+}
+
+# ---------- subcommand: claim ----------
+
+cmd_claim() {
+  local id="" agent_name="" assume_yes=0
+  while (($#)); do
+    case "$1" in
+      --agent) agent_name="$2"; shift 2 ;;
+      --yes|-y) assume_yes=1; shift ;;
+      T-*) id="$1"; shift ;;
+      *) die "unknown arg to claim: $1" ;;
+    esac
+  done
+  [[ -n "$id" ]] || die "usage: board claim <id> [--agent <name>] [--yes]"
+  [[ -n "$agent_name" ]] || agent_name="${USER:-unknown}@$(hostname -s)"
+  ASSUME_YES=$assume_yes
+
+  require_yq
+  require_main_checkout
+  require_clean
+
+  # Pull-rebase to surface any other agent's recent claim.
+  if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+    git -C "$ROOT" pull --rebase --quiet origin "$MAIN_BRANCH"
+  else
+    warn "no 'origin' remote configured; claim will be local only (no race protection)"
+  fi
+
+  local file
+  file=$(find_ticket "$id") || exit 1
+  local col
+  col=$(column_of "$file")
+  [[ "$col" == "todo" ]] || die "$id is in $col/, not todo/"
+
+  local current_agent
+  current_agent=$(read_field "$file" "agent")
+  [[ "$current_agent" == "null" ]] || die "$id already claimed by $current_agent"
+
+  deps_satisfied "$file" || die "$id has unmet dependencies"
+
+  local slug new_path
+  slug=$(parse_slug "$file")
+  new_path="$BOARD_DIR/in-progress/$slug.md"
+
+  # Mutate.
+  git -C "$ROOT" mv "$file" "$new_path"
+  write_field "$new_path" "agent" "\"$agent_name\""
+  write_field "$new_path" "claimed_at" "\"$(iso_now)\""
+  write_field "$new_path" "worktree" "\"../$(basename "$ROOT")-worktrees/$slug\""
+  git -C "$ROOT" add "$new_path"
+  git -C "$ROOT" commit --quiet -m "$id: claim"
+
+  # Push to serialize. If rejected, another agent beat us — bail cleanly.
+  if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+    if ! git -C "$ROOT" push --quiet origin "$MAIN_BRANCH" 2>/dev/null; then
+      warn "push rejected — another agent claimed $id first"
+      git -C "$ROOT" reset --hard --quiet "origin/$MAIN_BRANCH"
+      echo "claim_lost" >&2
+      exit 2
+    fi
+  fi
+
+  # Worktree only after push succeeds.
+  local wt_path="$WORKTREE_ROOT/$slug"
+  mkdir -p "$WORKTREE_ROOT"
+  git -C "$ROOT" worktree add -b "$slug" "$wt_path" "$MAIN_BRANCH" >/dev/null
+  echo "claimed $id as $agent_name"
+  echo "worktree: $wt_path"
+  echo "branch:   $slug"
+}
+
+# ---------- subcommand: transition ----------
+
+cmd_transition() {
+  local id="" to="" assume_yes=0
+  while (($#)); do
+    case "$1" in
+      --yes|-y) assume_yes=1; shift ;;
+      T-*) id="$1"; shift ;;
+      todo|in-progress|in-review|blocked|done) to="$1"; shift ;;
+      *) die "unknown arg to transition: $1" ;;
+    esac
+  done
+  [[ -n "$id" && -n "$to" ]] || die "usage: board transition <id> <to> [--yes]"
+  ASSUME_YES=$assume_yes
+
+  require_yq
+  require_main_checkout
+  require_clean
+
+  local file
+  file=$(find_ticket "$id") || exit 1
+  local from
+  from=$(column_of "$file")
+  if [[ "$from" == "$to" ]]; then
+    echo "$id already in $to/"
+    return 0
+  fi
+
+  local slug new_path
+  slug=$(parse_slug "$file")
+  new_path="$BOARD_DIR/$to/$slug.md"
+
+  # → done: require Outcome section in body.
+  if [[ "$to" == "done" ]]; then
+    if ! grep -qE '^## Outcome[[:space:]]*$' "$file"; then
+      die "refuse to mark $id done: no '## Outcome' section in body. Add one and retry."
+    fi
+  fi
+
+  confirm "move $id: $from → $to?" || { echo "aborted"; return 1; }
+
+  git -C "$ROOT" mv "$file" "$new_path"
+
+  # Per-transition frontmatter edits.
+  case "$to" in
+    in-progress)
+      write_field "$new_path" "claimed_at" "\"$(iso_now)\""
+      ;;
+    in-review)
+      write_field "$new_path" "claimed_at" "null"
+      ;;
+    done)
+      write_field "$new_path" "agent" "null"
+      write_field "$new_path" "worktree" "null"
+      write_field "$new_path" "claimed_at" "null"
+      ;;
+    blocked)
+      : # handled by `board block`; raw transition leaves blocked_reason as-is
+      ;;
+    todo)
+      write_field "$new_path" "agent" "null"
+      write_field "$new_path" "claimed_at" "null"
+      write_field "$new_path" "worktree" "null"
+      ;;
+  esac
+
+  git -C "$ROOT" add "$new_path"
+  git -C "$ROOT" commit --quiet -m "$id: $from → $to"
+
+  # → done: tear down worktree and (if merged) branch.
+  if [[ "$to" == "done" ]]; then
+    local wt_path="$WORKTREE_ROOT/$slug"
+    if git -C "$ROOT" worktree list --porcelain | grep -q "^worktree $wt_path$"; then
+      git -C "$ROOT" worktree remove "$wt_path" 2>/dev/null || warn "could not auto-remove worktree at $wt_path"
+    fi
+    if git -C "$ROOT" branch --merged "$MAIN_BRANCH" | grep -qE "^\s*$slug$"; then
+      git -C "$ROOT" branch -d "$slug" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  echo "$id: $from → $to"
+}
+
+# ---------- subcommand: block ----------
+
+cmd_block() {
+  local id="$1"; shift || die "usage: board block <id> <reason>"
+  local reason="${*:-}"
+  [[ -n "$reason" ]] || die "block requires a reason"
+  require_yq
+  require_main_checkout
+  require_clean
+
+  local file
+  file=$(find_ticket "$id") || exit 1
+  local from
+  from=$(column_of "$file")
+  [[ "$from" == "blocked" ]] && die "$id already blocked"
+
+  local slug new_path
+  slug=$(parse_slug "$file")
+  new_path="$BOARD_DIR/blocked/$slug.md"
+
+  git -C "$ROOT" mv "$file" "$new_path"
+  # Stash prior column in blocked_reason so unblock can return.
+  write_field "$new_path" "blocked_reason" "\"$reason (was: $from)\""
+  git -C "$ROOT" add "$new_path"
+  git -C "$ROOT" commit --quiet -m "$id: $from → blocked: $reason"
+  echo "$id blocked: $reason"
+}
+
+cmd_unblock() {
+  local id="$1" to="${2:-todo}"
+  require_yq
+  require_main_checkout
+  require_clean
+
+  local file
+  file=$(find_ticket "$id") || exit 1
+  [[ "$(column_of "$file")" == "blocked" ]] || die "$id is not in blocked/"
+
+  local slug new_path
+  slug=$(parse_slug "$file")
+  new_path="$BOARD_DIR/$to/$slug.md"
+
+  git -C "$ROOT" mv "$file" "$new_path"
+  write_field "$new_path" "blocked_reason" "null"
+  git -C "$ROOT" add "$new_path"
+  git -C "$ROOT" commit --quiet -m "$id: blocked → $to"
+  echo "$id unblocked → $to"
+}
+
+# ---------- subcommand: status ----------
+
+cmd_status() {
+  local col
+  echo "Board status ($BOARD_DIR)"
+  for col in "${COLUMNS[@]}"; do
+    local count
+    count=$(find "$BOARD_DIR/$col" -maxdepth 1 -name 'T-*.md' 2>/dev/null | wc -l | tr -d ' ')
+    printf '  %-12s %3d\n' "$col" "$count"
+  done
+  echo
+  echo "In progress:"
+  local any=0
+  local f
+  for f in "$BOARD_DIR"/in-progress/T-*.md; do
+    [[ -e "$f" ]] || continue
+    any=1
+    local id agent claimed_at title
+    id=$(read_field "$f" "id" | tr -d '"')
+    agent=$(read_field "$f" "agent" | tr -d '"')
+    claimed_at=$(read_field "$f" "claimed_at" | tr -d '"')
+    title=$(read_field "$f" "title" | tr -d '"')
+    printf '  %s  [%s]  claimed %s — %s\n' "$id" "$agent" "$claimed_at" "$title"
+  done
+  [[ $any -eq 0 ]] && echo "  (none)"
+}
+
+# ---------- subcommand: show ----------
+
+cmd_show() {
+  local id="$1"
+  local file
+  file=$(find_ticket "$id") || exit 1
+  echo "# $(column_of "$file")/$(basename "$file")"
+  echo
+  cat "$file"
+}
+
+# ---------- subcommand: doctor ----------
+
+cmd_doctor() {
+  local issues=0
+  # 1. No ticket appears in two columns at once.
+  local seen=""
+  local f
+  for f in "$BOARD_DIR"/{todo,in-progress,in-review,blocked,done}/T-*.md; do
+    [[ -e "$f" ]] || continue
+    local id
+    id=$(basename "$f" | grep -oE '^T-[0-9]+')
+    if grep -qw "$id" <<< "$seen"; then
+      warn "duplicate: $id appears in multiple columns"
+      issues=$((issues + 1))
+    fi
+    seen="$seen $id"
+  done
+  # 2. Required frontmatter fields present.
+  for f in "$BOARD_DIR"/{todo,in-progress,in-review,blocked,done}/T-*.md; do
+    [[ -e "$f" ]] || continue
+    local field
+    for field in id title depends_on estimate agent claimed_at worktree blocked_reason blocks; do
+      local val
+      val=$(read_field "$f" "$field" 2>/dev/null || echo "__missing__")
+      if [[ "$val" == "__missing__" ]]; then
+        warn "$(basename "$f"): missing frontmatter field: $field"
+        issues=$((issues + 1))
+      fi
+    done
+  done
+  # 3. Worktree consistency: in-progress/in-review tickets should have a worktree dir.
+  for f in "$BOARD_DIR"/{in-progress,in-review}/T-*.md; do
+    [[ -e "$f" ]] || continue
+    local wt
+    wt=$(read_field "$f" "worktree" | tr -d '"')
+    [[ "$wt" == "null" ]] && continue
+    if [[ ! -d "$ROOT/$wt" ]]; then
+      warn "$(basename "$f"): worktree path missing on disk: $wt"
+      issues=$((issues + 1))
+    fi
+  done
+  # 4. Branches without tickets.
+  if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    local b
+    while IFS= read -r b; do
+      [[ -z "$b" ]] && continue
+      [[ "$b" =~ ^T-[0-9]+- ]] || continue
+      local id
+      id=$(echo "$b" | grep -oE '^T-[0-9]+')
+      if ! find_ticket "$id" >/dev/null 2>&1; then
+        warn "branch $b has no matching ticket file"
+        issues=$((issues + 1))
+      fi
+    done < <(git -C "$ROOT" for-each-ref --format='%(refname:short)' refs/heads/)
+  fi
+
+  # 5. .next-id is sane: present, integer, and > max existing T-id.
+  local nf; nf=$(NEXT_ID_FILE)
+  if [[ ! -f "$nf" ]]; then
+    warn "$nf missing (initialize with: echo 1 > $nf)"
+    issues=$((issues + 1))
+  else
+    local n max_n
+    n=$(tr -d '[:space:]' < "$nf")
+    if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+      warn ".next-id is not an integer: $n"
+      issues=$((issues + 1))
+    else
+      max_n=$(max_existing_id)
+      if (( n <= max_n )); then
+        warn ".next-id desynced: would re-issue $(format_id "$n") (max existing is $(format_id "$max_n"))"
+        issues=$((issues + 1))
+      fi
+    fi
+  fi
+
+  if [[ $issues -eq 0 ]]; then
+    echo "board: clean"
+  else
+    echo "board: $issues issue(s) found" >&2
+    exit 1
+  fi
+}
+
+# ---------- dispatch ----------
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+  init) cmd_init "$@" ;;
+  next) cmd_next "$@" ;;
+  create) cmd_create "$@" ;;
+  update) cmd_update "$@" ;;
+  claim) cmd_claim "$@" ;;
+  transition) cmd_transition "$@" ;;
+  block) cmd_block "$@" ;;
+  unblock) cmd_unblock "$@" ;;
+  status) cmd_status "$@" ;;
+  show) cmd_show "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

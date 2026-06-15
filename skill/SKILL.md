@@ -65,10 +65,11 @@ Agents should pass `--yes` to any mutating command (`claim`, `transition`,
 
 1. **Spec pass — does the diff satisfy the ticket?** Check the change against the
    ticket's acceptance criteria, verification plan, and out-of-scope list.
-   - If this repo defines a `ticket-reviewer` subagent, invoke it via the `Agent`
-     tool (`subagent_type: 'ticket-reviewer'`), passing the ticket file path and
-     PR number. Otherwise do this as a careful self-review, or spawn a fresh
-     general-purpose subagent with the ticket file + diff.
+   - Invoke the `ticket-reviewer` subagent (installed with the board kit) via the
+     `Agent` tool (`subagent_type: 'ticket-reviewer'`), passing the ticket file path
+     and the PR number (or, working locally, the worktree path + branch). If this repo
+     didn't install the orchestration agents, do this as a careful self-review, or spawn
+     a fresh general-purpose subagent with the ticket file + diff.
    - **Address Blocker / Actionable findings before moving on.** If the work isn't
      actually complete, keep coding — don't transition.
 2. **Quality pass — generic code review.** Run `/code-review medium --comment` if
@@ -126,6 +127,14 @@ protocol is in `.board/README.md`. Two hard rules when going manual:
   single commit per transition.
 - Edit frontmatter with `yq` (the scripts use it); do **not** improvise YAML by
   hand. After any manual edit, run `board doctor`.
+
+## Autonomous orchestration
+
+If the board kit's orchestration layer is installed, an orchestrating agent can run
+**`/clear-board`** to clear the todo column autonomously — it claims each ticket and
+delegates to the `ticket-implementer` / `ticket-reviewer` subagents, fix-loops, and merges.
+Default is a PR-based flow; **`/clear-board local`** runs the whole cycle locally (no PR, no
+remote — commit → local review → `git merge --no-ff`). See `.claude/commands/clear-board.md`.
 
 ## Reference
 

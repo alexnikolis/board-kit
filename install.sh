@@ -69,7 +69,13 @@ done
 
 # ---------- locate the kit payload (SRC) ----------
 
-SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# BASH_SOURCE[0] is unset when piped via `curl … | bash` — guard against set -u.
+SELF_SRC="${BASH_SOURCE[0]:-}"
+if [[ -n "$SELF_SRC" ]]; then
+  SELF_DIR=$(cd "$(dirname "$SELF_SRC")" && pwd -P)
+else
+  SELF_DIR=""
+fi
 CLONE_TMP=""
 cleanup() { [[ -n "$CLONE_TMP" ]] && rm -rf "$CLONE_TMP"; }
 trap cleanup EXIT
